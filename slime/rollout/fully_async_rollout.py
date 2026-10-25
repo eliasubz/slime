@@ -258,17 +258,20 @@ class AsyncRolloutWorker:
                 self.error = error
                 return
             if not isinstance(result, list):
-                logger.warning(
-                    "fully-async: generate_and_rm_group returned %r, expected list[Sample]; dropping",
-                    type(result).__name__,
+                # The input group was already consumed from the data buffer, so
+                # dropping the result would silently lose those prompts.
+                self.error = TypeError(
+                    f"fully-async: generate_and_rm_group returned {type(result).__name__!r}, expected list[Sample]"
                 )
                 return
             # The early weight-update exit may return untouched PENDING inputs.
             if any(s.status in (Sample.Status.ABORTED, Sample.Status.PENDING) for s in iter_samples(result)):
                 try:
                     self.data_buffer.add_samples([prepare_retry_group(retry_group, result)])
-                except Exception:  # noqa: BLE001
+                except Exception as error:
+                    # A failed requeue loses the group; surface it to the consumer.
                     logger.exception("fully-async: failed to requeue aborted group")
+                    self.error = error
                 return
             self.output_queue.put((gid, result))
 

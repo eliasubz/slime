@@ -313,6 +313,39 @@ def test_unfinished_flat_group_is_requeued_without_discarding_partial_response(m
     assert worker.data_buffer.requeued[0][0] is group[0]
 
 
+class _FailingRequeueBuffer(_FakeDataBuffer):
+    def add_samples(self, groups):
+        raise RuntimeError("requeue failed")
+
+
+@pytest.mark.unit
+def test_failed_requeue_surfaces_to_consumer(monkeypatch):
+    """A requeue failure loses an already-consumed group, so it must fail the
+    rollout instead of only being logged (#2399)."""
+    worker = _make_worker(monkeypatch, data_buffer=_FailingRequeueBuffer([]))
+    group = [Sample(index=0, status=Sample.Status.ABORTED)]
+    worker._make_done_cb(0, group)(SimpleNamespace(result=lambda: group))
+    assert isinstance(worker.error, RuntimeError)
+    assert worker.queue_size() == 0
+
+    monkeypatch.setattr(fa, "_get_worker", lambda args, data_buffer: worker)
+    args = SimpleNamespace(
+        rollout_batch_size=1, rollout_data_transport="object-store", rollout_sample_filter_path=None
+    )
+    with pytest.raises(RuntimeError, match="requeue failed"):
+        asyncio.run(fa._generate_rollout_async(args, rollout_id=0, data_buffer=None))
+
+
+@pytest.mark.unit
+def test_non_list_generation_result_surfaces_to_consumer(monkeypatch):
+    """A generator returning the wrong type must not silently drop the group (#2399)."""
+    worker = _make_worker(monkeypatch)
+    worker._make_done_cb(0, _make_group(0))(SimpleNamespace(result=lambda: {"not": "a list"}))
+    assert isinstance(worker.error, TypeError)
+    assert "expected list[Sample]" in str(worker.error)
+    assert worker.queue_size() == 0
+
+
 @pytest.mark.unit
 def test_loop_backpressure_stops_topping_up_when_queue_is_full(monkeypatch):
     """With instantly-completing generations and plenty of fuel, the queue must
